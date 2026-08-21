@@ -40,7 +40,7 @@ backup. Per rimuoverne una, prima di disinstallare, usa l'helper indicando
 gli stessi dati con cui l'avevi creata:
 
 ```bash
-echo '{"server":"192.168.1.10","share":"sharename","mount":"/where/you/mountit","utente":"username"}' \
+echo '{"server":"nas.esempio.lan","share":"condivisione","mount":"/mnt/condivisione","utente":"utente"}' \
   | sudo /usr/libexec/montamelo/montamelo-helper rimuovi
 ```
 
@@ -50,21 +50,21 @@ l'avevi aggiunto, va tolto a mano dalla barra laterale di Nautilus oppure
 con:
 
 ```bash
-sed -i '\|^file:///mnt/garden |d' ~/.config/gtk-3.0/bookmarks
+sed -i '\|^file:///mnt/condivisione |d' ~/.config/gtk-3.0/bookmarks
 ```
 
 Se hai disinstallato il pacchetto prima di rimuovere una condivisione, puoi
 sempre farlo a mano:
 
 ```bash
-sudo systemctl disable --now mnt-garden.automount
-sudo rm /etc/systemd/system/mnt-garden.{mount,automount}
-sudo rm /etc/samba/credentials/montamelo-192.168.1.10-garden
+sudo systemctl disable --now mnt-condivisione.automount
+sudo rm /etc/systemd/system/mnt-condivisione.{mount,automount}
+sudo rm /etc/samba/credentials/montamelo-nas.esempio.lan-condivisione
 sudo systemctl daemon-reload
 ```
 
-Il nome delle unit deriva dal punto di mount: `/mnt/garden` diventa
-`mnt-garden`.
+Il nome delle unit deriva dal punto di mount: `/mnt/condivisione` diventa
+`mnt-condivisione`.
 
 ## Sviluppo
 
@@ -78,7 +78,7 @@ make check                          # verifica sintassi
 L'helper si collauda senza privilegi scrivendo in una radice alternativa:
 
 ```bash
-echo '{"server":"nas","share":"dati","mount":"/mnt/dati","utente":"mauro","password":"x"}' \
+echo '{"server":"nas.esempio.lan","share":"condivisione","mount":"/mnt/condivisione","utente":"utente","password":"x"}' \
   | ./montamelo-helper --root /tmp/prova installa
 ```
 
