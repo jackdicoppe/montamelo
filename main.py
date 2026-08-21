@@ -467,6 +467,19 @@ class FinestraWizard(Adw.ApplicationWindow):
         self.riga_attesa = Adw.ActionRow(title="Generazione anteprima…")
         self.gruppo_file.add(self.riga_attesa)
 
+        self.riga_segnalibro = Adw.SwitchRow(
+            title="Aggiungi ai preferiti del file manager",
+            subtitle="Crea un collegamento nella barra laterale di Nautilus",
+        )
+        self.riga_segnalibro.set_active(True)
+
+        self.riga_etichetta = Adw.EntryRow(title="Nome del collegamento")
+        self.riga_etichetta.set_text(self.dati["share"])
+
+        gruppo_opzioni = Adw.PreferencesGroup(title="Opzioni")
+        gruppo_opzioni.add(self.riga_segnalibro)
+        gruppo_opzioni.add(self.riga_etichetta)
+
         self.bottone_installa = Gtk.Button(label="Installa nel sistema")
         self.bottone_installa.add_css_class("suggested-action")
         self.bottone_installa.add_css_class("pill")
@@ -487,6 +500,7 @@ class FinestraWizard(Adw.ApplicationWindow):
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         box.append(self.gruppo_file)
+        box.append(gruppo_opzioni)
         box.append(self.bottone_installa)
         box.append(nota)
 
@@ -608,7 +622,41 @@ class FinestraWizard(Adw.ApplicationWindow):
             return
 
         self.bottone_installa.set_label("Installato")
-        self.mostra_esito_installazione(risposta.get("messaggi", []))
+        messaggi = risposta.get("messaggi", [])
+
+        # Il segnalibro sta nella home dell'utente: lo scrive la GUI,
+        # senza passare dall'helper e senza privilegi di root.
+        if self.riga_segnalibro.get_active():
+            messaggi.append(self.aggiungi_segnalibro())
+
+        self.mostra_esito_installazione(messaggi)
+
+    def aggiungi_segnalibro(self):
+        """Aggiunge una voce nella barra laterale dei file manager GTK."""
+        etichetta = self.riga_etichetta.get_text().strip() or self.dati["share"]
+        # GTK4 legge ancora questo percorso, il nome e' rimasto per compatibilita'
+        percorso = os.path.join(GLib.get_user_config_dir(), "gtk-3.0", "bookmarks")
+
+        try:
+            uri = GLib.filename_to_uri(self.dati["mount"], None)
+            os.makedirs(os.path.dirname(percorso), exist_ok=True)
+
+            try:
+                with open(percorso, encoding="utf-8") as lettura:
+                    righe = lettura.read().splitlines()
+            except FileNotFoundError:
+                righe = []
+
+            if any(riga.split(" ", 1)[0] == uri for riga in righe if riga.strip()):
+                return "Segnalibro gia' presente nel file manager"
+
+            righe.append(f"{uri} {etichetta}")
+            with open(percorso, "w", encoding="utf-8") as scrittura:
+                scrittura.write("\n".join(righe) + "\n")
+        except (OSError, GLib.Error) as errore:
+            return f"Segnalibro non aggiunto: {errore}"
+
+        return f"Aggiunto ai preferiti: {etichetta}"
 
     def ripristina_bottone_installa(self):
         self.bottone_installa.set_sensitive(True)
