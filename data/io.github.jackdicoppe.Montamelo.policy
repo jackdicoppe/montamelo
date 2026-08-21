@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Montamelo</vendor>
+  <vendor_url>https://github.com/jackdicoppe/montamelo</vendor_url>
+
+  <action id="io.github.jackdicoppe.Montamelo.configura">
+    <description>Configure a network share</description>
+    <description xml:lang="it">Configurare una condivisione di rete</description>
+    <message>Authentication is required to configure a network share</message>
+    <message xml:lang="it">Per configurare la condivisione di rete è necessario autenticarsi</message>
+
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/montamelo/montamelo-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

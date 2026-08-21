@@ -228,8 +228,8 @@ class FinestraWizard(Adw.ApplicationWindow):
 
         if processo.get_exit_status() != 0:
             self.avviso(
-                "smbclient ha restituito un errore:\n\n"
-                f"{(stderr or '').strip() or 'nessun dettaglio disponibile'}"
+                "Ricerca non riuscita.\n\n"
+                f"{self.riassumi_errore(stderr)}"
             )
             return
 
@@ -421,7 +421,11 @@ class FinestraWizard(Adw.ApplicationWindow):
         for codice, spiegazione in mappa.items():
             if codice in testo:
                 return spiegazione
-        return testo.splitlines()[0] if testo else "Errore non identificato"
+        return (
+            testo.splitlines()[0]
+            if testo
+            else "La ricerca non ha prodotto risultati, controlla nome utente e password"
+        )
 
     def aggiorna_esito(self, icona, titolo, sottotitolo):
         self.icona_esito.set_from_icon_name(icona)

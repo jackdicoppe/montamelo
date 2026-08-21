@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Montamelo - helper privilegiato.
+
+Riceve un documento JSON su stdin ed esegue una sola azione:
+
+    anteprima  genera i contenuti senza scrivere nulla (non serve root)
+    installa   crea cartella, file credenziali e unit systemd
+    rimuovi    disattiva e cancella quanto creato da installa
+
+Su stdout risponde con un JSON: {"ok": bool, "messaggi": [...], "file": {...}}
+
+La password arriva da stdin e non compare mai negli argomenti, altrimenti
+sarebbe leggibile da chiunque con `ps aux`.
+
+Durante lo sviluppo si collauda senza privilegi con --root:
+
+    echo '{...}' | ./montamelo-helper --root /tmp/finto-sistema installa
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+PREFISSO = "montamelo-"
+DIR_CREDENZIALI = "etc/samba/credentials"
+DIR_UNIT = "etc/systemd/system"
+
+# Percorsi che non devono mai diventare punti di mount, nemmeno come genitori:
+# un mount dentro /etc o /usr romperebbe il sistema
+RAMI_VIETATI = (
+    "/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/usr", "/var",
+)
+# Directory che non vanno usate direttamente, ma le cui sottocartelle vanno bene
+MOUNT_VIETATI = {"/", "/home", "/media", "/mnt", "/srv", "/tmp", "/opt"}
+
+# Server e share: niente spazi, slash o caratteri di controllo
+RE_SERVER = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
+RE_SHARE = re.compile(r"^[A-Za-z0-9._ -]{1,80}$")
+
+
+class ErroreValidazione(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------
+# Validazione: tutto ciò che arriva da stdin è considerato non fidato
+# ----------------------------------------------------------------------
+def valida(dati):
+    def testo(chiave, obbligatorio=True):
+        valore = str(dati.get(chiave, "")).strip()
+        if obbligatorio and not valore:
+            raise ErroreValidazione(f"Campo obbligatorio mancante: {chiave}")
+        if "\n" in valore or "\r" in valore or "\x00" in valore:
+            raise ErroreValidazione(f"Caratteri non ammessi nel campo {chiave}")
+        return valore
+
+    pulito = {
+        "server": testo("server"),
+        "share": testo("share"),
+        "mount": testo("mount"),
+        "utente": testo("utente"),
+        "dominio": testo("dominio", obbligatorio=False) or "WORKGROUP",
+    }
+
+    password = str(dati.get("password", ""))
+    if "\n" in password or "\r" in password or "\x00" in password:
+        raise ErroreValidazione("Caratteri non ammessi nella password")
+    pulito["password"] = password
+
+    if not RE_SERVER.match(pulito["server"]):
+        raise ErroreValidazione(f"Nome server non valido: {pulito['server']}")
+    if not RE_SHARE.match(pulito["share"]):
+        raise ErroreValidazione(f"Nome share non valido: {pulito['share']}")
+
+    grezzo = pulito["mount"]
+    if not grezzo.startswith("/"):
+        raise ErroreValidazione("Il punto di mount deve essere un percorso assoluto")
+    # Il controllo sui .. va fatto PRIMA di normpath, che altrimenti li
+    # risolve silenziosamente: /mnt/../etc diventerebbe /etc.
+    if ".." in grezzo.split("/"):
+        raise ErroreValidazione("Il punto di mount non puo' contenere '..'")
+
+    mount = os.path.normpath(grezzo)
+    if mount in MOUNT_VIETATI:
+        raise ErroreValidazione(f"{mount} e' una directory di sistema, scegline un'altra")
+    for ramo in RAMI_VIETATI:
+        if mount == ramo or mount.startswith(ramo + "/"):
+            raise ErroreValidazione(
+                f"Non e' possibile montare dentro {ramo}: e' riservato al sistema"
+            )
+    pulito["mount"] = mount
+
+    pulito["uid"] = int(dati.get("uid", 1000))
+    pulito["gid"] = int(dati.get("gid", 1000))
+    return pulito
+
+
+# ----------------------------------------------------------------------
+# Nomi dei file generati
+# ----------------------------------------------------------------------
+def escape_systemd(percorso):
+    """Equivalente di `systemd-escape -p`: /mnt/nas -> mnt-nas"""
+    grezzo = os.path.normpath(percorso).strip("/")
+    if not grezzo:
+        return "-"
+    risultato = []
+    for indice, byte in enumerate(grezzo.encode("utf-8")):
+        carattere = chr(byte)
+        if carattere == "/":
+            risultato.append("-")
+        elif carattere.isalnum() and byte < 128 or carattere == "_":
+            risultato.append(carattere)
+        elif carattere == "." and indice > 0:
+            risultato.append(".")
+        else:
+            risultato.append("\\x%02x" % byte)
+    return "".join(risultato)
+
+
+def nome_credenziali(dati):
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", f"{dati['server']}-{dati['share']}")
+    return PREFISSO + slug.lower()
+
+
+def nomi_unit(dati):
+    base = escape_systemd(dati["mount"])
+    return base + ".mount", base + ".automount"
+
+
+# ----------------------------------------------------------------------
+# Generazione dei contenuti
+# ----------------------------------------------------------------------
+def contenuto_credenziali(dati):
+    return (
+        f"username={dati['utente']}\n"
+        f"password={dati['password']}\n"
+        f"domain={dati['dominio']}\n"
+    )
+
+
+def opzioni_mount(dati, percorso_credenziali):
+    return ",".join([
+        f"credentials={percorso_credenziali}",
+        f"uid={dati['uid']}",
+        f"gid={dati['gid']}",
+        "file_mode=0664",
+        "dir_mode=0775",
+        "vers=3.0",
+        "iocharset=utf8",
+        "_netdev",
+    ])
+
+
+def contenuto_mount(dati, percorso_credenziali):
+    return (
+        "# Generato da Montamelo\n"
+        "[Unit]\n"
+        f"Description=Condivisione //{dati['server']}/{dati['share']}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Mount]\n"
+        f"What=//{dati['server']}/{dati['share']}\n"
+        f"Where={dati['mount']}\n"
+        "Type=cifs\n"
+        f"Options={opzioni_mount(dati, percorso_credenziali)}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def contenuto_automount(dati):
+    return (
+        "# Generato da Montamelo\n"
+        "[Unit]\n"
+        f"Description=Montaggio automatico di {dati['mount']}\n"
+        "\n"
+        "[Automount]\n"
+        f"Where={dati['mount']}\n"
+        "TimeoutIdleSec=600\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def piano(dati, radice):
+    """Calcola percorsi e contenuti. Non tocca il disco."""
+    percorso_credenziali = os.path.join("/", DIR_CREDENZIALI, nome_credenziali(dati))
+    nome_mount, nome_automount = nomi_unit(dati)
+
+    def assoluto(*parti):
+        return os.path.join(radice, *parti)
+
+    return {
+        "credenziali": {
+            "percorso": percorso_credenziali,
+            "reale": assoluto(DIR_CREDENZIALI, nome_credenziali(dati)),
+            "contenuto": contenuto_credenziali(dati),
+            "modo": 0o600,
+        },
+        "mount": {
+            "percorso": os.path.join("/", DIR_UNIT, nome_mount),
+            "reale": assoluto(DIR_UNIT, nome_mount),
+            "contenuto": contenuto_mount(dati, percorso_credenziali),
+            "modo": 0o644,
+        },
+        "automount": {
+            "percorso": os.path.join("/", DIR_UNIT, nome_automount),
+            "reale": assoluto(DIR_UNIT, nome_automount),
+            "contenuto": contenuto_automount(dati),
+            "modo": 0o644,
+        },
+        "cartella_mount": assoluto(dati["mount"].lstrip("/")),
+        "unit_automount": nome_automount,
+    }
+
+
+# ----------------------------------------------------------------------
+# Azioni
+# ----------------------------------------------------------------------
+def azione_anteprima(dati, radice):
+    p = piano(dati, radice)
+    return {
+        "ok": True,
+        "messaggi": ["Anteprima generata, nessuna modifica al sistema"],
+        "file": {
+            chiave: {
+                "percorso": p[chiave]["percorso"],
+                # La password non viene mai restituita all'interfaccia
+                "contenuto": (
+                    p[chiave]["contenuto"].replace(dati["password"], "********")
+                    if dati["password"]
+                    else p[chiave]["contenuto"]
+                ),
+            }
+            for chiave in ("credenziali", "mount", "automount")
+        },
+    }
+
+
+def azione_installa(dati, radice):
+    p = piano(dati, radice)
+    messaggi = []
+
+    os.makedirs(p["cartella_mount"], exist_ok=True)
+    messaggi.append(f"Cartella pronta: {dati['mount']}")
+
+    for chiave in ("credenziali", "mount", "automount"):
+        voce = p[chiave]
+        os.makedirs(os.path.dirname(voce["reale"]), exist_ok=True)
+        # Creo con i permessi giusti fin da subito: senza umask a 0o077 il
+        # file credenziali esisterebbe per un istante leggibile da tutti.
+        descrittore = os.open(
+            voce["reale"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, voce["modo"]
+        )
+        with os.fdopen(descrittore, "w") as scrittura:
+            scrittura.write(voce["contenuto"])
+        os.chmod(voce["reale"], voce["modo"])
+        messaggi.append(f"Scritto {voce['percorso']}")
+
+    if radice == "/":
+        esegui(["systemctl", "daemon-reload"], messaggi)
+        esegui(["systemctl", "enable", "--now", p["unit_automount"]], messaggi)
+    else:
+        messaggi.append(f"Modalita' di prova su {radice}: systemd non toccato")
+
+    return {"ok": True, "messaggi": messaggi, "file": {}}
+
+
+def azione_rimuovi(dati, radice):
+    p = piano(dati, radice)
+    messaggi = []
+
+    if radice == "/":
+        esegui(["systemctl", "disable", "--now", p["unit_automount"]], messaggi,
+               tollera_errori=True)
+
+    for chiave in ("automount", "mount", "credenziali"):
+        voce = p[chiave]
+        if os.path.exists(voce["reale"]):
+            os.remove(voce["reale"])
+            messaggi.append(f"Rimosso {voce['percorso']}")
+
+    if radice == "/":
+        esegui(["systemctl", "daemon-reload"], messaggi)
+
+    if os.path.isdir(p["cartella_mount"]) and not os.listdir(p["cartella_mount"]):
+        os.rmdir(p["cartella_mount"])
+        messaggi.append(f"Rimossa cartella vuota {dati['mount']}")
+
+    return {"ok": True, "messaggi": messaggi, "file": {}}
+
+
+def esegui(argv, messaggi, tollera_errori=False):
+    if shutil.which(argv[0]) is None:
+        messaggi.append(f"{argv[0]} non disponibile, passo oltre")
+        return
+    esito = subprocess.run(argv, capture_output=True, text=True)
+    if esito.returncode != 0 and not tollera_errori:
+        raise ErroreValidazione(
+            f"{' '.join(argv)} fallito: {esito.stderr.strip()}"
+        )
+    messaggi.append(" ".join(argv))
+
+
+AZIONI = {
+    "anteprima": azione_anteprima,
+    "installa": azione_installa,
+    "rimuovi": azione_rimuovi,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Helper privilegiato di Montamelo")
+    parser.add_argument("azione", choices=sorted(AZIONI))
+    parser.add_argument(
+        "--root",
+        default="/",
+        help="radice alternativa per le prove senza privilegi",
+    )
+    argomenti = parser.parse_args()
+
+    radice = os.path.abspath(argomenti.root) if argomenti.root != "/" else "/"
+
+    try:
+        dati = valida(json.load(sys.stdin))
+        risposta = AZIONI[argomenti.azione](dati, radice)
+    except ErroreValidazione as errore:
+        json.dump({"ok": False, "messaggi": [str(errore)]}, sys.stdout)
+        print()
+        return 1
+    except (json.JSONDecodeError, OSError) as errore:
+        json.dump({"ok": False, "messaggi": [f"Errore: {errore}"]}, sys.stdout)
+        print()
+        return 1
+
+    json.dump(risposta, sys.stdout)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
