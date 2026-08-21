@@ -167,36 +167,48 @@ class FinestraWizard(Adw.ApplicationWindow):
         argv = ["smbclient", "-L", f"//{server}", "-g"]
         argv += ["-N"] if anonimo else ["-U", utente]
 
+        self.bottone_sfoglia.set_sensitive(False)
+        self.bottone_sfoglia.set_label("Ricerca…")
+
+        avviato = self.esegui_smbclient(
+            argv,
+            None if anonimo else password,
+            self.on_ricerca_completata,
+            server,
+        )
+        if not avviato:
+            self.ripristina_bottone_sfoglia()
+
+    # ------------------------------------------------------------------
+    # Esecuzione asincrona di smbclient, condivisa da tutti i passi
+    # ------------------------------------------------------------------
+    def esegui_smbclient(self, argv, password, callback, dati_utente):
+        """Avvia smbclient in background. Ritorna False se non parte proprio."""
         launcher = Gio.SubprocessLauncher.new(
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
         )
         # LC_ALL=C: i messaggi di errore restano in inglese e prevedibili
         launcher.setenv("LC_ALL", "C", True)
-        if not anonimo:
+        if password is not None:
             # La password passa dall'ambiente e mai dagli argomenti:
             # in argv sarebbe leggibile da chiunque con `ps aux`.
             launcher.setenv("PASSWD", password, True)
 
-        self.bottone_sfoglia.set_sensitive(False)
-        self.bottone_sfoglia.set_label("Ricerca…")
-
         try:
             processo = launcher.spawnv(argv)
         except GLib.Error as errore:
-            self.ripristina_bottone_sfoglia()
             self.avviso(
                 "Impossibile eseguire smbclient. Installalo con:\n"
                 "sudo dnf install samba-client\n\n"
                 f"{errore.message}"
             )
-            return
+            return False
 
         # Il processo gira in background: l'interfaccia resta reattiva.
         cancellabile = Gio.Cancellable()
         GLib.timeout_add_seconds(10, self.on_timeout_ricerca, cancellabile)
-        processo.communicate_utf8_async(
-            None, cancellabile, self.on_ricerca_completata, server
-        )
+        processo.communicate_utf8_async(None, cancellabile, callback, dati_utente)
+        return True
 
     def on_timeout_ricerca(self, cancellabile):
         cancellabile.cancel()
@@ -302,10 +314,129 @@ class FinestraWizard(Adw.ApplicationWindow):
         self.dati["utente"] = self.riga_utente.get_text().strip()
         self.dati["password"] = self.riga_password.get_text()
         self.dati["dominio"] = self.riga_dominio.get_text().strip()
+        self.nav.push(self.pagina_verifica())
+
+    # ------------------------------------------------------------------
+    # Passo 3: verifica che la share sia davvero raggiungibile
+    # ------------------------------------------------------------------
+    def pagina_verifica(self):
+        gruppo = Adw.PreferencesGroup(
+            title="Verifica connessione",
+            description=(
+                "Controlla che la condivisione risponda con queste credenziali, "
+                "prima di scrivere qualsiasi cosa sul sistema"
+            ),
+        )
+
+        self.riga_esito = Adw.ActionRow(
+            title="Non ancora verificata",
+            subtitle=f"//{self.dati['server']}/{self.dati['share']}",
+        )
+        self.icona_esito = Gtk.Image.new_from_icon_name("dialog-question-symbolic")
+        self.riga_esito.add_prefix(self.icona_esito)
+        gruppo.add(self.riga_esito)
+
+        self.bottone_verifica = Gtk.Button(label="Verifica adesso")
+        self.bottone_verifica.add_css_class("pill")
+        self.bottone_verifica.set_halign(Gtk.Align.CENTER)
+        self.bottone_verifica.connect("clicked", self.on_verifica)
+
+        self.bottone_avanti_verifica = self._bottone_avanti(
+            "Avanti", self.on_avanti_verifica
+        )
+        self.bottone_avanti_verifica.set_sensitive(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.append(gruppo)
+        box.append(self.bottone_verifica)
+        box.append(self.bottone_avanti_verifica)
+
+        return self._pagina("3. Verifica", "verifica", box)
+
+    def on_verifica(self, _button):
+        # -c 'ls' apre la share, elenca la radice ed esce: è il modo più
+        # leggero per sapere se il mount vero funzionerebbe.
+        argv = [
+            "smbclient",
+            f"//{self.dati['server']}/{self.dati['share']}",
+            "-U",
+            self.dati["utente"],
+            "-W",
+            self.dati["dominio"] or "WORKGROUP",
+            "-c",
+            "ls",
+        ]
+
+        self.bottone_verifica.set_sensitive(False)
+        self.bottone_verifica.set_label("Verifica in corso…")
+        self.aggiorna_esito("dialog-question-symbolic", "Verifica in corso…", "")
+
+        avviato = self.esegui_smbclient(
+            argv, self.dati["password"], self.on_verifica_completata, None
+        )
+        if not avviato:
+            self.ripristina_bottone_verifica()
+
+    def on_verifica_completata(self, processo, risultato, _dati):
+        self.ripristina_bottone_verifica()
+
+        try:
+            _ok, _stdout, stderr = processo.communicate_utf8_finish(risultato)
+        except GLib.Error:
+            self.aggiorna_esito(
+                "network-offline-symbolic",
+                "Nessuna risposta",
+                "Il server non ha risposto entro 10 secondi",
+            )
+            return
+
+        if processo.get_exit_status() != 0:
+            self.aggiorna_esito(
+                "dialog-error-symbolic",
+                "Connessione fallita",
+                self.riassumi_errore(stderr),
+            )
+            return
+
+        self.dati["verificata"] = True
+        self.aggiorna_esito(
+            "emblem-ok-symbolic",
+            "Connessione riuscita",
+            "La condivisione risponde con queste credenziali",
+        )
+        self.bottone_avanti_verifica.set_sensitive(True)
+
+    @staticmethod
+    def riassumi_errore(stderr):
+        """Traduce gli errori più comuni di smbclient in qualcosa di leggibile."""
+        testo = (stderr or "").strip()
+        mappa = {
+            "LOGON_FAILURE": "Utente o password errati",
+            "ACCESS_DENIED": "Credenziali valide ma accesso negato alla share",
+            "BAD_NETWORK_NAME": "La share non esiste su questo server",
+            "CONNECTION_REFUSED": "Il server rifiuta la connessione (porta 445 chiusa?)",
+            "HOST_UNREACHABLE": "Server irraggiungibile: controlla indirizzo e rete",
+            "ACCOUNT_LOCKED_OUT": "Account bloccato sul server",
+        }
+        for codice, spiegazione in mappa.items():
+            if codice in testo:
+                return spiegazione
+        return testo.splitlines()[0] if testo else "Errore non identificato"
+
+    def aggiorna_esito(self, icona, titolo, sottotitolo):
+        self.icona_esito.set_from_icon_name(icona)
+        self.riga_esito.set_title(titolo)
+        self.riga_esito.set_subtitle(sottotitolo)
+
+    def ripristina_bottone_verifica(self):
+        self.bottone_verifica.set_sensitive(True)
+        self.bottone_verifica.set_label("Verifica adesso")
+
+    def on_avanti_verifica(self, _button):
         self.nav.push(self.pagina_riepilogo())
 
     # ------------------------------------------------------------------
-    # Passo 3: riepilogo (per ora si limita a mostrare la riga generata)
+    # Passo 4: riepilogo (per ora si limita a mostrare la riga generata)
     # ------------------------------------------------------------------
     def pagina_riepilogo(self):
         riga_fstab = (
@@ -349,7 +480,7 @@ class FinestraWizard(Adw.ApplicationWindow):
         box.append(gruppo)
         box.append(nota)
 
-        return self._pagina("3. Riepilogo", "riepilogo", box)
+        return self._pagina("4. Riepilogo", "riepilogo", box)
 
     # ------------------------------------------------------------------
     def avviso(self, messaggio):
