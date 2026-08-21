@@ -40,7 +40,7 @@ backup. Per rimuoverne una, prima di disinstallare, usa l'helper indicando
 gli stessi dati con cui l'avevi creata:
 
 ```bash
-echo '{"server":"192.168.1.10","share":"Garden","mount":"/mnt/garden","utente":"mauro"}' \
+echo '{"server":"192.168.1.10","share":"sharename","mount":"/where/you/mountit","utente":"username"}' \
   | sudo /usr/libexec/montamelo/montamelo-helper rimuovi
 ```
 
