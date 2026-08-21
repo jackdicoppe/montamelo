@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Montamelo
+GenericName=Network Shares
+GenericName[it]=Condivisioni di rete
+Comment=Set up a permanent SMB network share
+Comment[it]=Configura una condivisione di rete SMB permanente
+Exec=montamelo
+Icon=io.github.jackdicoppe.Montamelo
+Terminal=false
+Categories=System;Settings;HardwareSettings;GTK;
+Keywords=samba;smb;cifs;nas;share;mount;network;
+Keywords[it]=samba;smb;cifs;nas;condivisione;rete;montare;disco;
+StartupNotify=true
+StartupWMClass=montamelo
+X-GNOME-UsesNotifications=false

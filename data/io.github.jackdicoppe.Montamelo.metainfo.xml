@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.jackdicoppe.Montamelo</id>
+
+  <name>Montamelo</name>
+  <summary>Set up permanent network shares</summary>
+  <summary xml:lang="it">Configura condivisioni di rete permanenti</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      Montamelo is a step-by-step assistant that turns an SMB network share
+      into a real directory on your system, available to every application
+      including sandboxed ones.
+    </p>
+    <p xml:lang="it">
+      Montamelo è un assistente passo passo che trasforma una condivisione
+      di rete SMB in una cartella vera del sistema, accessibile a qualsiasi
+      applicazione comprese quelle in sandbox.
+    </p>
+    <ul>
+      <li>Browses the shares published by a server</li>
+      <li>Tests the connection before writing anything</li>
+      <li>Generates systemd mount units instead of editing fstab</li>
+      <li>Stores credentials in a file readable only by root</li>
+    </ul>
+    <ul xml:lang="it">
+      <li>Elenca le condivisioni pubblicate da un server</li>
+      <li>Verifica la connessione prima di scrivere qualsiasi cosa</li>
+      <li>Genera unit systemd invece di modificare fstab</li>
+      <li>Salva le credenziali in un file leggibile solo da root</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.jackdicoppe.Montamelo.desktop</launchable>
+  <url type="homepage">https://github.com/jackdicoppe/montamelo</url>
+  <url type="bugtracker">https://github.com/jackdicoppe/montamelo/issues</url>
+
+  <developer id="io.github.jackdicoppe">
+    <name>Mauro Caputi</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <categories>
+    <category>System</category>
+    <category>Settings</category>
+  </categories>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-22">
+      <description>
+        <p>First release.</p>
+        <p xml:lang="it">Prima versione.</p>
+      </description>
+    </release>
+  </releases>
+</component>
