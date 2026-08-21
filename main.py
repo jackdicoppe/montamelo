@@ -6,6 +6,8 @@ mostra alla fine la riga di mount che verrebbe generata.
 Serve solo per prendere confidenza con GTK4 / libadwaita.
 """
 
+import json
+import os
 import sys
 
 import gi
@@ -16,6 +18,21 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "io.github.jackdicoppe.Montamelo"
+
+
+def trova_helper():
+    """L'helper installato ha la precedenza; in sviluppo si usa quello locale."""
+    candidati = [
+        "/usr/libexec/montamelo/montamelo-helper",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "montamelo-helper"),
+    ]
+    for percorso in candidati:
+        if os.path.exists(percorso):
+            return percorso
+    return candidati[0]
+
+
+PERCORSO_HELPER = trova_helper()
 
 
 class FinestraWizard(Adw.ApplicationWindow):
@@ -440,51 +457,181 @@ class FinestraWizard(Adw.ApplicationWindow):
         self.nav.push(self.pagina_riepilogo())
 
     # ------------------------------------------------------------------
-    # Passo 4: riepilogo (per ora si limita a mostrare la riga generata)
+    # Passo 4: riepilogo reale, generato dall'helper, e installazione
     # ------------------------------------------------------------------
     def pagina_riepilogo(self):
-        riga_fstab = (
-            "//{server}/{share} {mount} cifs "
-            "credentials=/etc/samba/credentials/{nome},"
-            "uid=1000,gid=1000,vers=3.0,"
-            "_netdev,nofail,x-systemd.automount 0 0"
-        ).format(
-            server=self.dati["server"],
-            share=self.dati["share"],
-            mount=self.dati["mount"],
-            nome=self.dati["share"].replace("/", "_"),
+        self.gruppo_file = Adw.PreferencesGroup(
+            title="File che verranno creati",
+            description="Nessuno di questi esiste ancora sul sistema",
+        )
+        self.riga_attesa = Adw.ActionRow(title="Generazione anteprima…")
+        self.gruppo_file.add(self.riga_attesa)
+
+        self.bottone_installa = Gtk.Button(label="Installa nel sistema")
+        self.bottone_installa.add_css_class("suggested-action")
+        self.bottone_installa.add_css_class("pill")
+        self.bottone_installa.set_halign(Gtk.Align.CENTER)
+        self.bottone_installa.set_sensitive(False)
+        self.bottone_installa.connect("clicked", self.on_installa)
+
+        nota = Gtk.Label(
+            label=(
+                "Verrà chiesta la password di amministratore: la scrittura "
+                "avviene in un processo separato, l'interfaccia non gira mai "
+                "con privilegi di root."
+            )
+        )
+        nota.set_wrap(True)
+        nota.set_justify(Gtk.Justification.CENTER)
+        nota.add_css_class("dim-label")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.append(self.gruppo_file)
+        box.append(self.bottone_installa)
+        box.append(nota)
+
+        pagina = self._pagina("4. Riepilogo", "riepilogo", box)
+        # L'anteprima non richiede privilegi: la chiediamo subito all'helper
+        self.esegui_helper("anteprima", False, self.on_anteprima_completata)
+        return pagina
+
+    def payload_helper(self):
+        """Il documento JSON che l'helper riceve su stdin."""
+        return {
+            "server": self.dati["server"],
+            "share": self.dati["share"],
+            "mount": self.dati["mount"],
+            "utente": self.dati["utente"],
+            "password": self.dati["password"],
+            "dominio": self.dati["dominio"] or "WORKGROUP",
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+        }
+
+    def esegui_helper(self, azione, con_privilegi, callback):
+        argv = [PERCORSO_HELPER, azione]
+        if con_privilegi:
+            # pkexec mostra il dialogo di autenticazione e riesegue l'helper
+            # come root: l'interfaccia resta un normale processo utente.
+            argv = ["pkexec"] + argv
+
+        launcher = Gio.SubprocessLauncher.new(
+            Gio.SubprocessFlags.STDIN_PIPE
+            | Gio.SubprocessFlags.STDOUT_PIPE
+            | Gio.SubprocessFlags.STDERR_PIPE
+        )
+        launcher.setenv("LC_ALL", "C", True)
+
+        try:
+            processo = launcher.spawnv(argv)
+        except GLib.Error as errore:
+            self.avviso(f"Impossibile avviare l'helper:\n\n{errore.message}")
+            return False
+
+        # I dati (password compresa) viaggiano su stdin, mai su argv.
+        processo.communicate_utf8_async(
+            json.dumps(self.payload_helper()), None, callback, None
+        )
+        return True
+
+    @staticmethod
+    def leggi_risposta(processo, risultato):
+        """Ritorna (risposta_dict, errore_stringa)."""
+        try:
+            _ok, stdout, stderr = processo.communicate_utf8_finish(risultato)
+        except GLib.Error as errore:
+            return None, errore.message
+
+        if not (stdout or "").strip():
+            uscita = processo.get_exit_status()
+            if uscita == 126:
+                return None, "Autenticazione annullata."
+            return None, (stderr or "").strip() or "L'helper non ha risposto."
+
+        try:
+            return json.loads(stdout), None
+        except json.JSONDecodeError:
+            return None, f"Risposta non leggibile dall'helper:\n\n{stdout[:400]}"
+
+    def on_anteprima_completata(self, processo, risultato, _dati):
+        risposta, errore = self.leggi_risposta(processo, risultato)
+        if errore or not risposta.get("ok"):
+            self.riga_attesa.set_title("Anteprima non riuscita")
+            self.riga_attesa.set_subtitle(
+                errore or "; ".join(risposta.get("messaggi", []))
+            )
+            return
+
+        self.gruppo_file.remove(self.riga_attesa)
+        for voce in risposta.get("file", {}).values():
+            self.gruppo_file.add(self.riga_file(voce))
+        self.bottone_installa.set_sensitive(True)
+
+    @staticmethod
+    def riga_file(voce):
+        """Una riga espandibile che mostra il contenuto del file generato."""
+        riga = Adw.ExpanderRow(
+            title=os.path.basename(voce["percorso"]),
+            subtitle=os.path.dirname(voce["percorso"]),
         )
 
-        gruppo = Adw.PreferencesGroup(
-            title="Riepilogo",
-            description="Riga di mount che verrà generata",
-        )
-
-        etichetta = Gtk.Label(label=riga_fstab)
-        etichetta.set_wrap(True)
+        etichetta = Gtk.Label(label=voce["contenuto"].strip())
         etichetta.set_selectable(True)
         etichetta.set_xalign(0)
+        etichetta.set_wrap(True)
         etichetta.add_css_class("monospace")
         etichetta.set_margin_top(12)
         etichetta.set_margin_bottom(12)
         etichetta.set_margin_start(12)
         etichetta.set_margin_end(12)
 
-        contenitore = Gtk.Frame()
-        contenitore.set_child(etichetta)
-        gruppo.add(contenitore)
+        contenuto = Adw.ActionRow()
+        contenuto.set_child(etichetta)
+        riga.add_row(contenuto)
+        return riga
 
-        nota = Gtk.Label(
-            label="In questa versione non viene scritto nulla sul sistema."
+    def on_installa(self, _button):
+        self.bottone_installa.set_sensitive(False)
+        self.bottone_installa.set_label("Installazione in corso…")
+        if not self.esegui_helper("installa", True, self.on_installa_completata):
+            self.ripristina_bottone_installa()
+
+    def on_installa_completata(self, processo, risultato, _dati):
+        risposta, errore = self.leggi_risposta(processo, risultato)
+
+        if errore or not risposta.get("ok"):
+            self.ripristina_bottone_installa()
+            self.avviso(
+                "Installazione non riuscita.\n\n"
+                + (errore or "\n".join(risposta.get("messaggi", [])))
+            )
+            return
+
+        self.bottone_installa.set_label("Installato")
+        self.mostra_esito_installazione(risposta.get("messaggi", []))
+
+    def ripristina_bottone_installa(self):
+        self.bottone_installa.set_sensitive(True)
+        self.bottone_installa.set_label("Installa nel sistema")
+
+    def mostra_esito_installazione(self, messaggi):
+        dialogo = Adw.AlertDialog(
+            heading="Condivisione configurata",
+            body=(
+                f"{self.dati['mount']} verrà montata automaticamente "
+                "al primo accesso, anche dopo un riavvio."
+            ),
         )
-        nota.set_wrap(True)
-        nota.add_css_class("dim-label")
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        box.append(gruppo)
-        box.append(nota)
+        lista = Gtk.ListBox()
+        lista.add_css_class("boxed-list")
+        lista.set_selection_mode(Gtk.SelectionMode.NONE)
+        for messaggio in messaggi:
+            lista.append(Adw.ActionRow(title=messaggio))
 
-        return self._pagina("4. Riepilogo", "riepilogo", box)
+        dialogo.set_extra_child(lista)
+        dialogo.add_response("chiudi", "Chiudi")
+        dialogo.present(self)
 
     # ------------------------------------------------------------------
     def avviso(self, messaggio):
