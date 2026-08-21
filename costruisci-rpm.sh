@@ -15,13 +15,22 @@ BUILD="$HOME/rpmbuild"
 
 echo "Costruzione di $NOME $VERSIONE"
 
-# La prima volta servono gli strumenti di packaging
-for pacchetto in rpm-build rpmdevtools desktop-file-utils libappstream-glib; do
+# Servono gli strumenti di packaging
+for pacchetto in rpm-build rpmdevtools; do
     rpm -q "$pacchetto" >/dev/null 2>&1 || {
         echo "Manca $pacchetto, lo installo"
         sudo dnf install -y "$pacchetto"
     }
 done
+
+# Le dipendenze di build vengono lette dallo spec, cosi' non possono
+# andare fuori sincrono con quanto dichiarato in BuildRequires
+DIPENDENZE=$(rpmspec -q --buildrequires "$DIR/$NOME.spec" | awk '{print $1}')
+if [[ -n "$DIPENDENZE" ]]; then
+    echo "Dipendenze di build: $(echo "$DIPENDENZE" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    sudo dnf install -y $DIPENDENZE
+fi
 
 rpmdev-setuptree
 
@@ -37,6 +46,11 @@ cp "$DIR/$NOME.spec" "$BUILD/SPECS/"
 rpmbuild -ba "$BUILD/SPECS/$NOME.spec"
 
 PACCHETTO=$(find "$BUILD/RPMS" -name "$NOME-$VERSIONE-*.rpm" | head -n1)
+if [[ -z "$PACCHETTO" ]]; then
+    echo "Build fallita: nessun pacchetto prodotto." >&2
+    exit 1
+fi
+
 echo
 echo "Pacchetto pronto: $PACCHETTO"
 echo "Installalo con:   sudo dnf install $PACCHETTO"
