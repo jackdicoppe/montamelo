@@ -29,6 +29,10 @@ PREFISSO = "montamelo-"
 DIR_CREDENZIALI = "etc/samba/credentials"
 DIR_UNIT = "etc/systemd/system"
 
+# Prima riga di ogni file generato: e' cio' che ci autorizza a rimuoverlo.
+# Una unit senza questo marcatore non viene mai toccata.
+MARCATORE = "# Generato da Montamelo"
+
 # Percorsi che non devono mai diventare punti di mount, nemmeno come genitori:
 # un mount dentro /etc o /usr romperebbe il sistema
 RAMI_VIETATI = (
@@ -49,6 +53,31 @@ class ErroreValidazione(Exception):
 # ----------------------------------------------------------------------
 # Validazione: tutto ciò che arriva da stdin è considerato non fidato
 # ----------------------------------------------------------------------
+def valida_percorso_mount(grezzo):
+    """Controlla solo il punto di mount: serve alle azioni di rimozione."""
+    grezzo = str(grezzo or "").strip()
+    if not grezzo:
+        raise ErroreValidazione("Campo obbligatorio mancante: mount")
+    if "\n" in grezzo or "\r" in grezzo or "\x00" in grezzo:
+        raise ErroreValidazione("Caratteri non ammessi nel campo mount")
+    if not grezzo.startswith("/"):
+        raise ErroreValidazione("Il punto di mount deve essere un percorso assoluto")
+    # Il controllo sui .. va fatto PRIMA di normpath, che altrimenti li
+    # risolve silenziosamente: /mnt/../etc diventerebbe /etc.
+    if ".." in grezzo.split("/"):
+        raise ErroreValidazione("Il punto di mount non puo' contenere '..'")
+
+    mount = os.path.normpath(grezzo)
+    if mount in MOUNT_VIETATI:
+        raise ErroreValidazione(f"{mount} e' una directory di sistema, scegline un'altra")
+    for ramo in RAMI_VIETATI:
+        if mount == ramo or mount.startswith(ramo + "/"):
+            raise ErroreValidazione(
+                f"Non e' possibile montare dentro {ramo}: e' riservato al sistema"
+            )
+    return mount
+
+
 def valida(dati):
     def testo(chiave, obbligatorio=True):
         valore = str(dati.get(chiave, "")).strip()
@@ -76,23 +105,7 @@ def valida(dati):
     if not RE_SHARE.match(pulito["share"]):
         raise ErroreValidazione(f"Nome share non valido: {pulito['share']}")
 
-    grezzo = pulito["mount"]
-    if not grezzo.startswith("/"):
-        raise ErroreValidazione("Il punto di mount deve essere un percorso assoluto")
-    # Il controllo sui .. va fatto PRIMA di normpath, che altrimenti li
-    # risolve silenziosamente: /mnt/../etc diventerebbe /etc.
-    if ".." in grezzo.split("/"):
-        raise ErroreValidazione("Il punto di mount non puo' contenere '..'")
-
-    mount = os.path.normpath(grezzo)
-    if mount in MOUNT_VIETATI:
-        raise ErroreValidazione(f"{mount} e' una directory di sistema, scegline un'altra")
-    for ramo in RAMI_VIETATI:
-        if mount == ramo or mount.startswith(ramo + "/"):
-            raise ErroreValidazione(
-                f"Non e' possibile montare dentro {ramo}: e' riservato al sistema"
-            )
-    pulito["mount"] = mount
+    pulito["mount"] = valida_percorso_mount(pulito["mount"])
 
     pulito["uid"] = int(dati.get("uid", 1000))
     pulito["gid"] = int(dati.get("gid", 1000))
@@ -157,7 +170,7 @@ def opzioni_mount(dati, percorso_credenziali):
 
 def contenuto_mount(dati, percorso_credenziali):
     return (
-        "# Generato da Montamelo\n"
+        f"{MARCATORE}\n"
         "[Unit]\n"
         f"Description=Condivisione //{dati['server']}/{dati['share']}\n"
         "After=network-online.target\n"
@@ -176,7 +189,7 @@ def contenuto_mount(dati, percorso_credenziali):
 
 def contenuto_automount(dati):
     return (
-        "# Generato da Montamelo\n"
+        f"{MARCATORE}\n"
         "[Unit]\n"
         f"Description=Montaggio automatico di {dati['mount']}\n"
         "\n"
@@ -297,6 +310,115 @@ def azione_rimuovi(dati, radice):
     return {"ok": True, "messaggi": messaggi, "file": {}}
 
 
+def leggi_unit(percorso):
+    """Legge una unit .mount generata da noi. Ritorna None per le altre."""
+    try:
+        with open(percorso, encoding="utf-8") as lettura:
+            testo = lettura.read()
+    except OSError:
+        return None
+
+    if not testo.startswith(MARCATORE):
+        return None
+
+    campi = {}
+    for riga in testo.splitlines():
+        if "=" in riga and not riga.startswith("#"):
+            chiave, _, valore = riga.partition("=")
+            campi.setdefault(chiave.strip(), valore.strip())
+
+    credenziali = ""
+    for opzione in campi.get("Options", "").split(","):
+        if opzione.startswith("credentials="):
+            credenziali = opzione.split("=", 1)[1]
+
+    return {
+        "mount": campi.get("Where", ""),
+        "origine": campi.get("What", ""),
+        "credenziali": credenziali,
+        "unit": os.path.basename(percorso),
+    }
+
+
+def risulta_montato(percorso):
+    try:
+        with open("/proc/mounts", encoding="utf-8") as lettura:
+            for riga in lettura:
+                campi = riga.split()
+                if len(campi) > 1 and campi[1].replace("\\040", " ") == percorso:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def azione_elenca(_dati, radice):
+    cartella = os.path.join(radice, DIR_UNIT)
+    elenco = []
+
+    try:
+        nomi = sorted(os.listdir(cartella))
+    except OSError:
+        nomi = []
+
+    for nome in nomi:
+        if not nome.endswith(".mount"):
+            continue
+        voce = leggi_unit(os.path.join(cartella, nome))
+        if voce and voce["mount"]:
+            voce["montato"] = radice == "/" and risulta_montato(voce["mount"])
+            elenco.append(voce)
+
+    return {
+        "ok": True,
+        "messaggi": [f"Trovate {len(elenco)} condivisioni configurate"],
+        "condivisioni": elenco,
+    }
+
+
+def azione_rimuovi_percorso(dati, radice):
+    """Rimuove una condivisione conoscendo solo il punto di mount."""
+    mount = valida_percorso_mount(dati.get("mount"))
+    nome_mount, nome_automount = nomi_unit({"mount": mount})
+    cartella = os.path.join(radice, DIR_UNIT)
+    file_mount = os.path.join(cartella, nome_mount)
+
+    # Rifiutiamo di toccare qualsiasi unit che non abbia il nostro marcatore
+    voce = leggi_unit(file_mount)
+    if voce is None:
+        raise ErroreValidazione(
+            f"{mount} non risulta configurato da Montamelo: non lo tocco"
+        )
+
+    messaggi = []
+
+    if radice == "/":
+        esegui(["systemctl", "disable", "--now", nome_automount], messaggi,
+               tollera_errori=True)
+        esegui(["systemctl", "stop", nome_mount], messaggi, tollera_errori=True)
+
+    da_rimuovere = [os.path.join(cartella, nome_automount), file_mount]
+    if voce["credenziali"].startswith("/"):
+        da_rimuovere.append(
+            os.path.join(radice, voce["credenziali"].lstrip("/"))
+        )
+
+    for percorso in da_rimuovere:
+        if os.path.exists(percorso):
+            os.remove(percorso)
+            messaggi.append(f"Rimosso {percorso[len(radice):] or percorso}")
+
+    if radice == "/":
+        esegui(["systemctl", "daemon-reload"], messaggi)
+
+    cartella_mount = os.path.join(radice, mount.lstrip("/"))
+    if os.path.isdir(cartella_mount) and not os.listdir(cartella_mount):
+        os.rmdir(cartella_mount)
+        messaggi.append(f"Rimossa cartella vuota {mount}")
+
+    return {"ok": True, "messaggi": messaggi, "file": {}}
+
+
 def esegui(argv, messaggi, tollera_errori=False):
     if shutil.which(argv[0]) is None:
         messaggi.append(f"{argv[0]} non disponibile, passo oltre")
@@ -313,7 +435,12 @@ AZIONI = {
     "anteprima": azione_anteprima,
     "installa": azione_installa,
     "rimuovi": azione_rimuovi,
+    "elenca": azione_elenca,
+    "rimuovi-percorso": azione_rimuovi_percorso,
 }
+
+# Azioni che non richiedono i dati completi di una condivisione
+AZIONI_SENZA_VALIDAZIONE = {"elenca", "rimuovi-percorso"}
 
 
 def main():
@@ -329,7 +456,11 @@ def main():
     radice = os.path.abspath(argomenti.root) if argomenti.root != "/" else "/"
 
     try:
-        dati = valida(json.load(sys.stdin))
+        grezzi = json.load(sys.stdin)
+        if argomenti.azione in AZIONI_SENZA_VALIDAZIONE:
+            dati = grezzi
+        else:
+            dati = valida(grezzi)
         risposta = AZIONI[argomenti.azione](dati, radice)
     except ErroreValidazione as errore:
         json.dump({"ok": False, "messaggi": [str(errore)]}, sys.stdout)

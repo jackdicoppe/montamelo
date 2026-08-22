@@ -109,6 +109,16 @@ class FinestraWizard(Adw.ApplicationWindow):
         box.append(gruppo)
         box.append(self._bottone_avanti("Avanti", self.on_avanti_server))
 
+        separatore = Gtk.Separator()
+        separatore.set_margin_top(12)
+        box.append(separatore)
+
+        bottone_gestione = Gtk.Button(label="Rimuovi mount fatte con Montamelo")
+        bottone_gestione.add_css_class("flat")
+        bottone_gestione.set_halign(Gtk.Align.CENTER)
+        bottone_gestione.connect("clicked", self.on_apri_gestione)
+        box.append(bottone_gestione)
+
         return self._pagina("1. Server", "server", box)
 
     def on_avanti_server(self, _button):
@@ -300,6 +310,120 @@ class FinestraWizard(Adw.ApplicationWindow):
     def ripristina_bottone_sfoglia(self):
         self.bottone_sfoglia.set_sensitive(True)
         self.bottone_sfoglia.set_label("Sfoglia")
+
+    # ------------------------------------------------------------------
+    # Gestione delle condivisioni gia' configurate
+    # ------------------------------------------------------------------
+    def on_apri_gestione(self, _button):
+        self.gruppo_gestione = Adw.PreferencesGroup(
+            title="Condivisioni configurate",
+            description="Solo quelle create da Montamelo: le altre non vengono toccate",
+        )
+        self.righe_gestione = []
+        self.aggiungi_riga_gestione(Adw.ActionRow(title="Lettura in corso…"))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        box.append(self.gruppo_gestione)
+
+        self.nav.push(self._pagina("Gestione", "gestione", box))
+        self.aggiorna_elenco_gestione()
+
+    def aggiorna_elenco_gestione(self):
+        # Le unit sono leggibili da tutti: nessuna autenticazione per l'elenco
+        self.esegui_helper("elenca", False, self.on_elenco_completato, payload={})
+
+    def on_elenco_completato(self, processo, risultato, _dati):
+        risposta, errore = self.leggi_risposta(processo, risultato)
+
+        self.svuota_gruppo(self.gruppo_gestione)
+
+        if errore or not risposta.get("ok"):
+            self.aggiungi_riga_gestione(
+                Adw.ActionRow(
+                    title="Lettura non riuscita",
+                    subtitle=errore or "; ".join(risposta.get("messaggi", [])),
+                )
+            )
+            return
+
+        condivisioni = risposta.get("condivisioni", [])
+        if not condivisioni:
+            self.aggiungi_riga_gestione(
+                Adw.ActionRow(
+                    title="Nessuna condivisione configurata",
+                    subtitle="Quelle create da Montamelo compariranno qui",
+                )
+            )
+            return
+
+        for voce in condivisioni:
+            self.aggiungi_riga_gestione(self.riga_condivisione(voce))
+
+    def svuota_gruppo(self, gruppo):
+        # Teniamo noi l'elenco delle righe aggiunte: ispezionare i figli
+        # interni di PreferencesGroup dipenderebbe da dettagli di libadwaita
+        # che possono cambiare da una versione all'altra.
+        for riga in self.righe_gestione:
+            gruppo.remove(riga)
+        self.righe_gestione = []
+
+    def aggiungi_riga_gestione(self, riga):
+        self.gruppo_gestione.add(riga)
+        self.righe_gestione.append(riga)
+        return riga
+
+    def riga_condivisione(self, voce):
+        riga = Adw.ActionRow(
+            title=voce["mount"],
+            subtitle=voce["origine"],
+        )
+        icona = "media-mount-symbolic" if voce.get("montato") else "media-eject-symbolic"
+        riga.add_prefix(Gtk.Image.new_from_icon_name(icona))
+
+        bottone = Gtk.Button(icon_name="user-trash-symbolic")
+        bottone.set_valign(Gtk.Align.CENTER)
+        bottone.add_css_class("flat")
+        bottone.add_css_class("destructive-action")
+        bottone.set_tooltip_text("Rimuovi questa condivisione")
+        bottone.connect("clicked", self.on_chiedi_rimozione, voce)
+        riga.add_suffix(bottone)
+        return riga
+
+    def on_chiedi_rimozione(self, _button, voce):
+        dialogo = Adw.AlertDialog(
+            heading="Rimuovere la condivisione?",
+            body=(
+                f"{voce['mount']} verrà smontata e la configurazione "
+                "cancellata. I file sul server non vengono toccati."
+            ),
+        )
+        dialogo.add_response("annulla", "Annulla")
+        dialogo.add_response("rimuovi", "Rimuovi")
+        dialogo.set_response_appearance("rimuovi", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialogo.connect("response", self.on_conferma_rimozione, voce)
+        dialogo.present(self)
+
+    def on_conferma_rimozione(self, _dialogo, risposta, voce):
+        if risposta != "rimuovi":
+            return
+        self.esegui_helper(
+            "rimuovi-percorso",
+            True,
+            self.on_rimozione_completata,
+            payload={"mount": voce["mount"]},
+        )
+
+    def on_rimozione_completata(self, processo, risultato, _dati):
+        risposta, errore = self.leggi_risposta(processo, risultato)
+
+        if errore or not risposta.get("ok"):
+            self.avviso(
+                "Rimozione non riuscita.\n\n"
+                + (errore or "\n".join(risposta.get("messaggi", [])))
+            )
+            return
+
+        self.aggiorna_elenco_gestione()
 
     # ------------------------------------------------------------------
     # Passo 2: credenziali
@@ -522,7 +646,7 @@ class FinestraWizard(Adw.ApplicationWindow):
             "gid": os.getgid(),
         }
 
-    def esegui_helper(self, azione, con_privilegi, callback):
+    def esegui_helper(self, azione, con_privilegi, callback, payload=None):
         argv = [PERCORSO_HELPER, azione]
         if con_privilegi:
             # pkexec mostra il dialogo di autenticazione e riesegue l'helper
@@ -543,9 +667,8 @@ class FinestraWizard(Adw.ApplicationWindow):
             return False
 
         # I dati (password compresa) viaggiano su stdin, mai su argv.
-        processo.communicate_utf8_async(
-            json.dumps(self.payload_helper()), None, callback, None
-        )
+        dati = self.payload_helper() if payload is None else payload
+        processo.communicate_utf8_async(json.dumps(dati), None, callback, None)
         return True
 
     @staticmethod
